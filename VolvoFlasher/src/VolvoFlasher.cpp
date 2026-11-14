@@ -56,7 +56,8 @@ enum class RunMode
 	Read,
 	Wakeup,
 	Pin,
-	Test
+	Test,
+	Check
 };
 
 unsigned long hexStringToUlong(const std::string& str)
@@ -71,13 +72,14 @@ unsigned long hexStringToUlong(const std::string& str)
 bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
 	unsigned long& baudrate, std::string& flashPath, uint64_t& pin,
 	uint8_t& ecuId, unsigned long& start, unsigned long& datasize,
-	RunMode& runMode, std::string& sblPath, common::CarPlatform& carPlatform, bool& pinUpward, bool& verbose) {
+	RunMode& runMode, std::string& sblPath, common::CarPlatform& carPlatform, std::string& cmInfo, bool& pinUpward, bool& verbose) {
 	argparse::ArgumentParser program("VolvoFlasher", "1.0", argparse::default_arguments::help);
 	program.add_argument("-d", "--device").default_value(std::string{}).help("Device name");
 	program.add_argument("-b", "--baudrate").scan<'u', unsigned long>().default_value(500000u).help("CAN bus speed");
 	program.add_argument("-f", "--platform").default_value(std::string{ "P2" }).help("Car's platform, supported values: P80, P1, P1_UDS, P2, P2_250, P2_UDS, P3, SPA");
     program.add_argument("-e", "--ecu").default_value("7A").help("ECU id");
     program.add_argument("-p", "--pin").default_value("0x0").help("PIN to unlock ECU");
+	program.add_argument("-c", "--cm").default_value(std::string{}).help("ECU variant, selects SBL and flash layout (e.g. me9_p1, me9_p3, tf80_p2, aw55_p2). Defaults to me9_p1 for P1 ECM 7A");
 	program.add_argument("-v", "--verbose").default_value(false).implicit_value(true).nargs(0).help("Enable verbose (debug) logging");
 
 	argparse::ArgumentParser flash_command("flash", "1.0", argparse::default_arguments::help);
@@ -101,7 +103,12 @@ bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
 	argparse::ArgumentParser wakeup_command("wakeup", "1.0", argparse::default_arguments::help);
 	wakeup_command.add_description("Wake up CAN network");
 
+	argparse::ArgumentParser check_command("check", "1.0", argparse::default_arguments::help);
+	check_command.add_description("Offline: show the SBL and flash layout a file would be flashed with (no device used)");
+	check_command.add_argument("-i", "--input").help("File to check");
+
 	program.add_subparser(flash_command);
+	program.add_subparser(check_command);
 	program.add_subparser(read_command);
 	program.add_subparser(test_command);
 	program.add_subparser(pin_command);
@@ -129,6 +136,10 @@ bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
 		else if (program.is_subcommand_used(wakeup_command)) {
 			runMode = RunMode::Wakeup;
 		}
+		else if (program.is_subcommand_used(check_command)) {
+			flashPath = check_command.get("-i");
+			runMode = RunMode::Check;
+		}
 		else {
 			std::cout << program;
 			return false;
@@ -138,6 +149,13 @@ bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
         ecuId = static_cast<uint8_t>(hexStringToUlong(program.get("-e")));
         carPlatform = common::parseCarPlatform(program.get<std::string>("-f"));
         pin = hexStringToUlong(program.get("-p"));
+        cmInfo = program.get("-c");
+        // The P1 Bosch ECM is ME9; without this the ME7 SBL would be uploaded to it.
+        if (cmInfo.empty() && carPlatform == common::CarPlatform::P1 &&
+            ecuId == to_underlying(common::D2ECUType::ECM_ME)) {
+            cmInfo = "me9_p1";
+            std::cout << "ECU variant not given, using me9_p1 for P1 ECM" << std::endl;
+        }
 		verbose = program.get<bool>("-v");
 		return true;
 	}
@@ -739,19 +757,68 @@ common::VBF vbfForFlasher(const std::vector<uint8_t>& input)
     return common::VBF({}, { { 0x0, input } });
 }
 
-void D2Flash(const std::string& flashPath, std::unique_ptr<j2534::J2534> j2534, unsigned long baudrate)
+struct D2FlashSetup {
+    common::CarPlatform carPlatform;
+    uint32_t ecuId;
+    flasher::D2FlasherConfig config;
+};
+
+// Without an ECU variant this keeps the original ME7 behaviour (P2/P2_250 by baudrate,
+// raw image at offset 0). With a variant (e.g. me9_p1) the platform/ECU from the command
+// line are used, the image is split by the variant's layout with checksums corrected,
+// and the matching SBL is selected.
+D2FlashSetup makeD2FlashSetup(const std::string& flashPath, unsigned long baudrate,
+    common::CarPlatform carPlatform, uint8_t ecuId, const std::string& cmInfo)
 {
-	std::fstream input(flashPath,
-		std::ios_base::binary | std::ios_base::in);
-	std::vector<uint8_t> bin{ std::istreambuf_iterator<char>(input), {} };
-
-    const auto vbf = vbfForFlasher(bin);
-	const auto carPlatform = baudrate == 500000 ? common::CarPlatform::P2 : common::CarPlatform::P2_250;
-
-    const uint32_t ecuId = to_underlying(common::D2ECUType::ECM_ME);
+	std::ifstream input(flashPath, std::ios_base::binary);
+	if (!input) {
+		throw std::runtime_error("Can't open flash file " + flashPath);
+	}
 	flasher::SBLProviderCommon sblProviderCommon;
-    flasher::D2FlasherConfig config{ sblProviderCommon.getSBL(carPlatform, ecuId, ""), vbf };
-    flasher::D2Flasher flasher(*j2534, carPlatform, ecuId, std::move(config));
+	if (cmInfo.empty()) {
+		std::vector<uint8_t> bin{ std::istreambuf_iterator<char>(input), {} };
+		const auto platform = baudrate == 500000 ? common::CarPlatform::P2 : common::CarPlatform::P2_250;
+		const uint32_t ecm = to_underlying(common::D2ECUType::ECM_ME);
+		return { platform, ecm,
+			flasher::D2FlasherConfig{ sblProviderCommon.getSBL(platform, ecm, ""), vbfForFlasher(bin) } };
+	}
+	auto vbf = common::loadVBFForFlasher(carPlatform, ecuId, cmInfo, flashPath, input);
+	if (vbf.chunks.empty()) {
+		throw std::runtime_error("Failed to read flash file " + flashPath);
+	}
+	auto sbl = sblProviderCommon.getSBL(carPlatform, ecuId, cmInfo);
+	if (sbl.chunks.empty()) {
+		throw std::runtime_error("No SBL known for ECU variant " + cmInfo);
+	}
+	return { carPlatform, ecuId, flasher::D2FlasherConfig{ std::move(sbl), std::move(vbf) } };
+}
+
+void printD2FlashSetup(const D2FlashSetup& setup, const std::string& cmInfo)
+{
+	std::cout << std::hex << std::uppercase
+		<< "Platform:    " << std::dec << to_underlying(setup.carPlatform) << std::hex << " (CarPlatform enum)" << std::endl
+		<< "ECU:         0x" << setup.ecuId << std::endl
+		<< "Variant:     " << (cmInfo.empty() ? "(none, legacy ME7 mode)" : cmInfo) << std::endl
+		<< "SBL call:    0x" << setup.config.bootloader.header.call << std::endl;
+	for (const auto& chunk : setup.config.bootloader.chunks) {
+		std::cout << "SBL chunk:   0x" << chunk.writeOffset << " size 0x" << chunk.data.size() << std::endl;
+	}
+	for (const auto& block : setup.config.flash.header.eraseBlocks) {
+		std::cout << "Erase:       0x" << block.startAddr << " size 0x" << block.length << std::endl;
+	}
+	for (const auto& chunk : setup.config.flash.chunks) {
+		std::cout << "Flash chunk: 0x" << chunk.writeOffset << " size 0x" << chunk.data.size()
+			<< " crc16 0x" << chunk.crc << std::endl;
+	}
+	std::cout << std::dec;
+}
+
+void D2Flash(const std::string& flashPath, std::unique_ptr<j2534::J2534> j2534, unsigned long baudrate,
+    common::CarPlatform carPlatform, uint8_t ecuId, const std::string& cmInfo)
+{
+	auto setup = makeD2FlashSetup(flashPath, baudrate, carPlatform, ecuId, cmInfo);
+	printD2FlashSetup(setup, cmInfo);
+    flasher::D2Flasher flasher(*j2534, setup.carPlatform, setup.ecuId, std::move(setup.config));
 	FlasherCallback callback;
 	flasher.registerCallback(callback);
     flasher.start();
@@ -793,21 +860,25 @@ void fill_crc_map()
 	}
 }
 
-void readFlash(std::unique_ptr<j2534::J2534> j2534, common::CarPlatform carPlatform, uint8_t ecuId, const std::string& flashPath, unsigned long start, unsigned long datasize)
+void readFlash(std::unique_ptr<j2534::J2534> j2534, common::CarPlatform carPlatform, uint8_t ecuId, const std::string& cmInfo, const std::string& flashPath, unsigned long start, unsigned long datasize)
 {
     class CLIReaderProvider final : public flasher::ReaderParametersProviderBase {
     public:
-        CLIReaderProvider(common::CarPlatform platform, uint32_t id,
+        CLIReaderProvider(common::CarPlatform platform, uint32_t id, const std::string& cm,
                           uint32_t s, size_t sz)
-            : ReaderParametersProviderBase(platform, id, "", std::make_unique<flasher::SBLProviderCommon>())
+            : ReaderParametersProviderBase(platform, id, cm, std::make_unique<flasher::SBLProviderCommon>())
             , _range{ s, sz } {}
         flasher::ReadRanges getReadRanges() const override { return {_range}; }
     private:
         flasher::ReadRange _range;
     };
 
-    auto provider = CLIReaderProvider(carPlatform, ecuId,
+    auto provider = CLIReaderProvider(carPlatform, ecuId, cmInfo,
         static_cast<uint32_t>(start), static_cast<size_t>(datasize));
+    if (const auto bootloader = provider.getBootloaderParams(); bootloader) {
+        std::cout << "Read uses SBL with call address 0x" << std::hex << std::uppercase
+            << bootloader->bootloader.header.call << std::dec << std::endl;
+    }
     auto reader = flasher::ReaderFactory::create(*j2534, provider);
     FlasherCallback callback;
     reader->registerCallback(callback);
@@ -929,6 +1000,7 @@ int main(int argc, const char* argv[]) {
 	std::string deviceName;
 	std::string flashPath;
 	std::string sblPath;
+	std::string cmInfo;
 	common::CarPlatform carPlatform = common::CarPlatform::Undefined;
 	uint64_t pin = 0;
 	unsigned long start = 0;
@@ -938,10 +1010,33 @@ int main(int argc, const char* argv[]) {
 	bool scanPinsUpward = true;
 	bool verbose = false;
 	const auto devices = common::getAvailableDevices();
-	if (getRunOptions(argc, argv, deviceName, baudrate, flashPath, pin, ecuId, start, datasize, runMode, sblPath, carPlatform, scanPinsUpward, verbose)) {
+	if (getRunOptions(argc, argv, deviceName, baudrate, flashPath, pin, ecuId, start, datasize, runMode, sblPath, carPlatform, cmInfo, scanPinsUpward, verbose)) {
         if (verbose) {
             common::initLogger("application.log", true, true);
         }
+		if (runMode == RunMode::Check) {
+			try {
+				printD2FlashSetup(makeD2FlashSetup(flashPath, baudrate, carPlatform, ecuId, cmInfo), cmInfo);
+			}
+			catch (const std::exception& ex) {
+				std::cout << ex.what() << std::endl;
+				return 1;
+			}
+			return 0;
+		}
+		if (runMode == RunMode::Flash || runMode == RunMode::Read) {
+			const auto matches = std::count_if(devices.cbegin(), devices.cend(), [&deviceName](const auto& device) {
+				return deviceName.empty() || device.deviceName.find(deviceName) != std::string::npos;
+			});
+			if (matches != 1) {
+				std::cout << (matches == 0 ? "No J2534 device matches" : "More than one J2534 device matches")
+					<< " -d \"" << deviceName << "\". Pick exactly one with -d:" << std::endl;
+				for (const auto& device : devices) {
+					std::cout << "    " << device.deviceName << std::endl;
+				}
+				return 1;
+			}
+		}
 		for (const auto& device : devices) {
 			if (deviceName.empty() ||
 				device.deviceName.find(deviceName) != std::string::npos) {
@@ -961,7 +1056,7 @@ int main(int argc, const char* argv[]) {
 						findPin2(*j2534, carPlatform, ecuId, pin, scanPinsUpward);
 					}
 					else if (runMode == RunMode::Read) {
-						readFlash(std::move(j2534), carPlatform, ecuId, flashPath, start, datasize);
+						readFlash(std::move(j2534), carPlatform, ecuId, cmInfo, flashPath, start, datasize);
 					}
 					else if (runMode == RunMode::Flash) {
                         const auto ecuInfo{ common::getEcuInfoByEcuId(carPlatform, ecuId) };
@@ -969,7 +1064,7 @@ int main(int argc, const char* argv[]) {
                             UDSFlash(carPlatform, ecuId, std::move(j2534), baudrate, pin, flashPath, sblPath);
 						}
 						else {
-							D2Flash(flashPath, std::move(j2534), baudrate);
+							D2Flash(flashPath, std::move(j2534), baudrate, carPlatform, ecuId, cmInfo);
 						}
 					}
 					else if (runMode == RunMode::Test) {
